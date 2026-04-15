@@ -16,7 +16,7 @@ The detailed visual tracking of cumulative recall indicates that PCA correctly p
 ## Key Files
 * `scripts/evaluation.ipynb` - The primary Jupyter Notebook serving as the all-in-one visualizer, computing component comparisons, printing metrics (ROC-AUC, PR-AUC, Recall), and plotting the runtime and score distributions.
 * `scripts/utils.py` - Consolidated utility file containing all python functionality, including the data loading logic, metric calculations, and the Moment Pooling class implementation.
-* `data/` - Holds the dataset, specifically the catalog `protege_catalogue.csv`.
+* `data/` - Holds the dataset, specifically the catalog `protege_catalogue.csv` and the features `mgcls_byol_features.parquet`.
 
 ## Quick Start
 To interactively reproduce the analyses, visualizations, and metrics, simply execute the cells within the provided notebook:
