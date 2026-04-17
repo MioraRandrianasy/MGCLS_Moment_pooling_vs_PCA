@@ -55,3 +55,4 @@ class MomentPooling:
         Z_poly = self.poly.fit_transform(Z)
         feature_names = self._make_feature_names(Z.shape[1])
         return pd.DataFrame(Z_poly, index=X.index, columns=feature_names)
+
