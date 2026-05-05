@@ -9,12 +9,12 @@ BYOL features are 512-dimensional vectors whose individual dimensions have very 
 
 The paper arXiv:2403.08854 proposes this as a smarter alternative to just using PCA components as features. The logic is:
 
-1. First, PCA compresses 512 dimensions down to `latent_dim` (say 8) components keeping only the directions of maximum variance.
+1. First, PCA compresses 512 dimensions down to `latent_dim` (note: 8) components keeping only the directions of maximum variance.
 2. Then, `PolynomialFeatures` with `order=2` expands those 8 values into all their combinations: the original 8 values, their squares (z0², z1², …), and their cross-products (z0·z1, z0·z2, …). That gives 44 features.
 
 Those cross-products are what matter. A plain PCA score only captures "is this object far from the mean in the big directions?" Moment Pooling also captures "does this object have an unusual *relationship* between dimensions?" — which is closer to what the human annotators are labelling as interesting. The bias column (the constant 1 term) is dropped before scoring because it carries no information about the object.
 
-The `fit`/`transform` split I added to `utils.py` is important for correctness: you fit PCA on the training data only, then apply the same learned transformation to new data. Without that split, if you ever evaluate on a held-out set, you'd be leaking information from the test set into the PCA axes.
+The `fit`/`transform` split added to `utils.py` is important for correctness: you fit PCA on the training data only, then apply the same learned transformation to new data. Without that split, if you ever evaluate on a held-out set, you'd be leaking information from the test set into the PCA axes.
 
 ---
 
@@ -43,6 +43,20 @@ Standard IF has a documented geometric bias: because it only makes axis-aligned 
 These are the "statistical anomaly detection on pre-computed features" approach. ECOD estimates, for each dimension independently, how extreme a value is by looking at its empirical cumulative distribution (what fraction of the data is more extreme in the left or right tail). It then combines these per-dimension tail probabilities. It's parameter-free, fast, and interpretable, you can see which dimensions made a point look anomalous. COPOD does something similar but models the joint distribution using copulas, which can capture dependencies between dimensions that ECOD misses.
 
 Both work directly on the Moment Pooling features without needing any hyperparameter tuning, which is why they're good early candidates.
+
+---
+
+**Supervised vs Unsupervised: When does the algorithm "train"?**
+
+One crucial detail in this notebook is understanding *when* and *how* the algorithms learn. In traditional supervised machine learning, you split your data into a training set and a testing set, and you feed the algorithm both the features and the labels so it can learn to predict the specific anomalies you are looking for.
+
+In this notebook, **none of the models are trained with labels**. We are doing purely **unsupervised** anomaly detection. 
+- The human labels (`y_interesting`, derived from `evaluation_subset_author_ML_score`) are separated at the very beginning and are never passed to any model.
+- **The "Training" (Fitting) phase**: When we call `.fit()` or `.fit_transform()` on `PCA`, `MomentPooling`, `IsolationForest`, `ECOD`, or `COPOD`, we only provide the features (e.g. `X` or `X_mp_clean`). The algorithms "train" by looking at the entire dataset to learn its underlying statistical structure (such as the principal components, the expected distribution, or the best ways to isolate points). They don't know which points are actual anomalies; they simply map out what the "normal" background looks like.
+- **The "Scoring" phase**: When we extract the anomaly scores (e.g., via `.score_samples()` or `.decision_scores_`), the models are purely measuring how much each object deviates from that learned normal background.
+- **The "Evaluation" phase**: We only bring the labels back at the very end to evaluate the results. Functions like `compute_metrics` compare the unsupervised scores against the hidden human labels to see how well the algorithms' mathematical definition of "unusual" aligns with the human annotators' definition of "interesting" (giving us our ROC-AUC and PR-AUC scores).
+
+Because the algorithms are unsupervised (they don't "cheat" by looking at the answers), it's acceptable to evaluate their performance on the same dataset they were fitted on for this exploratory analysis. However, as noted in the Moment Pooling section, if we want to deploy this to production to score *new* radio sources, we would only `.fit()` on historical data and use `.transform()` or `.score_samples()` on the new data.
 
 ---
 
