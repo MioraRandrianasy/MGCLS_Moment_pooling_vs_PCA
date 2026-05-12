@@ -1,219 +1,246 @@
-# Anomaly Detection Evaluation Pipeline — Technical Explanation
+# Anomaly Detection on MGCLS — Notebook Explanation
 
-This document explains the methodology, design choices, and results of
-`scripts/evaluation.ipynb`, which benchmarks anomaly detection strategies
-on MGCLS (MeerKAT Galaxy Cluster Legacy Survey) radio-source features
-extracted with BYOL (Bootstrap Your Own Latent).
+**Author:** Internship project, University of the Western Cape, 2026  
+**Notebook:** `evaluation.ipynb`
 
 ---
 
-## 1. Data & Ground Truth
+## What is the goal?
 
-**Input features** (`X`): BYOL embeddings — one 512-dimensional vector per
-radio source.  
-**Labels** (`labels`): Expert-assigned interest scores from 1 (ordinary) to 5
-(highly anomalous).  
-**Binary anomaly flag** (`y_interesting`): sources with score ≥ 4 are treated
-as anomalies (positive class).
+The goal is to automatically find **anomalous radio sources** in the MGCLS dataset — sources that a human astronomer would find scientifically interesting — without using any human labels during detection.
 
-The dataset is highly imbalanced: anomalies (score 4–5) represent a small
-fraction of the full catalogue, which is why PR-AUC and Recall@100 carry more
-diagnostic weight than ROC-AUC alone.
+We compare several approaches against a **gold-standard baseline called Protege**, which was built by the supervisor using a human-in-the-loop active learning system. Our methods have no access to human labels. Everything they do is purely based on the data itself.
 
 ---
 
-## 2. Evaluation Metrics
+## The Data
 
-| Metric | Definition | Why it matters |
+| Element | Description |
+|---|---|
+| **BYOL features** | 512-dimensional vectors per radio source, extracted by a self-supervised neural network (BYOL). Each source is a point in a 512-dim space. |
+| **Catalogue labels** | Human scores from 1–5 per source (`evaluation_subset_author_ML_score`). Score ≥ 4 means "interesting / anomalous". |
+| **Protege score** | A pre-computed anomaly score from the supervisor's pipeline — our gold standard. |
+
+**Key preprocessing step:** Every BYOL feature vector is standardised with `StandardScaler` (zero mean, unit variance per dimension) before any method is applied. This is mandatory because detectors are sensitive to scale — without it, large-valued dimensions would dominate everything.
+
+---
+
+## How Performance Is Measured
+
+None of the methods output a label like "4" or "5". They all output a **continuous anomaly score** — a number meaning "how anomalous do I think this object is?" The score scale differs by method (it doesn't matter). What matters is the **ranking**: does a method put truly interesting sources near the top?
+
+Performance is evaluated by comparing each method's ranking against the catalogue labels (≥ 4 → interesting, else → normal).
+
+| Metric | What it measures | Range |
 |---|---|---|
-| **ROC-AUC (4–5)** | Area under the ROC curve, anomaly = score ≥ 4 | Global ranking quality |
-| **PR-AUC (4–5)** | Area under the Precision-Recall curve | Robust to class imbalance |
-| **Recall@100 (4–5)** | Fraction of true anomalies in the top-100 predictions | Operational: how many rare objects are surfaced in a short review list |
-| **Spearman (1–5)** | Rank correlation between anomaly score and full expert label | Sensitivity across the whole 1–5 scale, not just the binary threshold |
+| **ROC-AUC (4-5)** | If you pick one true anomaly and one normal object at random, probability the method ranks the anomaly higher | 0.5 = random, 1.0 = perfect |
+| **PR-AUC (4-5)** | Precision–recall tradeoff when anomalies are rare. Low for everyone because anomalies are a small fraction of the dataset. | 0 to 1, low expected |
+| **Recall@100 (4-5)** | Among the top 100 candidates the method flags, what fraction of all true anomalies are found | 0 to 1 |
+| **Spearman (1-5)** | Does the score track the full 1–5 human scale monotonically | −1 to 1, near 0 expected |
+
+**The cumulative discovery plot** shows all of this visually: x = how many candidates a human has reviewed, y = how many true anomalies have been found so far. A steep early rise = a good method.
 
 ---
 
-## 3. Feature Representations
+## Notebook Structure — Step by Step
 
-### 3.1 PCA (Protege baseline)
+---
 
-The **Protege** pipeline compresses the 512-dim BYOL vectors using Principal
-Component Analysis (PCA) and then scores each source by its **reconstruction
-error** — the L2 distance between the original embedding and its PCA
-approximation. A large reconstruction error indicates that the source does not
-fit the principal subspace defined by the bulk of the population, and is
-therefore anomalous.
+### Setup (Cells 1–9)
 
-PCA is a linear, closed-form method: no training loop is required once the
-projection matrix has been fitted on the data.
+**What happens:** Install dependencies (`pyod`, `eif`, `torch`), import all libraries, load the BYOL features and catalogue, align them by object ID, create `y_interesting` (binary: 1 if label ≥ 4), and standardise the features.
 
-### 3.2 Raw BYOL Features
+**Why:** Every method from this point on works on `X_scaled` — the standardised features. The labels are only used at evaluation time, never during detection.
 
-Some detectors are applied directly to the full 512-dim BYOL vectors without
-any dimensionality reduction. This tests whether the high-dimensional space
-already separates anomalies well enough for a detector to exploit.
+---
 
-### 3.3 Moment Pooling (MP)
+### Baseline (Cells 10–11)
 
-Moment Pooling compresses the BYOL representation by computing **statistical
-moments** of feature groups:
+**What happens:** Load the Protege score from the catalogue.
 
-* **Order 2** (mean + variance per group) → 2 × `latent_dim` features  
-* **Order 3** (mean + variance + skewness per group) → 3 × `latent_dim` features
+**Why:** This is the reference we are trying to match. It was produced by the supervisor's full system with real human labels. Every result in this notebook is compared against it.
 
-The result is a compact, statistically rich vector of dimension
-`order × latent_dim`.
+| Metric | Protege |
+|---|---|
+| ROC-AUC | 0.8674 |
+| PR-AUC | 0.1052 |
+| Recall@100 | 0.1744 |
+| Spearman | ~0.017 |
 
-A hyperparameter sweep was run over:
+---
 
-| `latent_dim` | `order` | Output dim |
+### Moment Pooling — First Run (Cells 12–27)
+
+**What is Moment Pooling?**
+
+Moment Pooling (arXiv:2403.08854) is a dimensionality reduction technique. It takes the 512-dim BYOL features and compresses them in two steps:
+
+1. **PCA** — reduces to `latent_dim` components (e.g. 8), keeping the most important directions
+2. **Polynomial expansion** — computes all cross-products and powers up to degree `order` (e.g. z0², z0·z1, z1², etc.)
+
+This gives a compact feature vector that captures not just means but also variances and cross-correlations between dimensions — richer statistics than plain PCA.
+
+**First run configuration:** `latent_dim=8`, `order=2` → 44 features
+
+**Methods applied to MP features:**
+
+| Method | What it does |
+|---|---|
+| **MP + L2** | Euclidean distance from the origin in moment space. Simple but limited — misses semantic anomalies. |
+| **MP + IsoForest** | Isolation Forest: builds random trees, anomalies are isolated in fewer splits. 300 trees, uses `score_samples`. |
+| **MP + EIF** | Extended Isolation Forest (arXiv:2110.13402): uses random hyperplane cuts instead of axis-aligned splits, fixing a geometric bias in standard IF. |
+| **MP + ECOD** | Parameter-free detector: estimates how extreme each feature value is using empirical tail probabilities, combines per dimension. |
+| **MP + COPOD** | Copula-based: models joint distributions between features, handles non-Gaussian data. |
+
+**First evaluation (Evaluation v1):** Results showed all methods below Protege.
+
+---
+
+### Improvement: Hyperparameter Sweep (Cells 29–34)
+
+**Date noted in notebook: 24 April 2026**
+
+**What happens:** A grid search over Moment Pooling hyperparameters:
+
+- `latent_dim` ∈ {4, 8, 16} — how many PCA components to keep
+- `order` ∈ {2, 3} — polynomial degree (2 = variances + covariances, 3 = adds cubic / skewness terms)
+
+ECOD is used as the downstream detector for all 6 combinations. Results are shown as heatmaps of ROC-AUC, PR-AUC, and Recall@100.
+
+**Why:** The initial `latent_dim=8, order=2` was a guess. The sweep finds the configuration that actually performs best on this specific dataset.
+
+**Result found:**
+
+| Config | ROC-AUC | Recall@100 |
 |---|---|---|
-| 4 | 2 | 8 |
-| 4 | 3 | 12 |
-| 8 | 2 | 16 |
-| 8 | 3 | 24 |
-| 16 | 2 | 32 |
-| **16** | **3** | **44** |
+| `latent_dim=16, order=3` | 0.5584 | 0.0465 |
+| *(best found)* | | |
 
-The best configuration (`latent_dim=16`, `order=3`) yielding a **44-dim**
-representation was selected and used for all subsequent Moment Pooling
-experiments.
+**Note:** Even the best config is below the initial default (latent_dim=8, order=2) on ROC-AUC in some metrics. The notebook marks this as a notable finding: **"THE SCORE INCREASE"** — meaning the sweep helped identify a configuration where at least some metrics improved.
 
 ---
 
-## 4. Anomaly Detectors
+### Re-run All Methods with Best HP (Cells 35–55)
 
-### 4.1 Static (Training-Free) Detectors
+**What happens:** The best Moment Pooling configuration (`latent_dim=16, order=3`, giving a larger feature space) is applied. All five methods (L2, IsoForest, EIF, ECOD, COPOD) are recomputed on the new MP features.
 
-These methods compute anomaly scores analytically from the feature matrix —
-no iterative training loop is needed.
+**Then Step 2 is added:** ECOD and COPOD are run directly on raw BYOL features (no PCA at all), after a variance threshold filter that removes near-constant dimensions.
 
-| Detector | Input | How it scores anomalies |
+| Step | Input features | Methods |
 |---|---|---|
-| **L2 distance** | MP features | Euclidean distance of each point from the dataset centroid |
-| **ECOD** | Raw BYOL or MP | Empirical Cumulative Distribution functions; estimates tail probability in each dimension |
-| **COPOD** | Raw BYOL or MP | Copula-based tail probability; models feature dependence before estimating outlierness |
+| Re-run v2 | MP (latent_dim=16, order=3) | L2, IsoForest, EIF, ECOD, COPOD |
+| Step 2 — Raw BYOL | Full 512-dim BYOL (variance-filtered) | ECOD, COPOD |
 
-### 4.2 Detectors Requiring a Training Phase
+**Why raw BYOL?** Moment Pooling's PCA step might discard the exact directions where anomalies live. Skipping PCA tests whether the compression helps or hurts.
 
-These methods fit a model on the unlabelled data before scoring.
-
-| Detector | Input | Training objective |
-|---|---|---|
-| **Isolation Forest (IsoForest)** | MP features | Random recursive partitioning; anomalies are isolated in fewer splits |
-| **Extended Isolation Forest (EIF)** | MP features | Like IsoForest but uses random hyperplane cuts, reducing bias near the boundary |
-| **DeepSVDD (BYOL)** | Raw BYOL (512-dim) | Neural network maps inputs to a hypersphere; distance from centre = anomaly score |
-| **DeepSVDD (MP)** | MP features (44-dim) | Same objective on the compressed representation |
-
-#### DeepSVDD Architecture
-
-A bias-free MLP (no bias terms, no BatchNorm) is trained to map all sources
-into a compact hypersphere centred at `c`. Three rules prevent trivial
-hypersphere collapse:
-
-1. **No bias terms** — a bias could shift all outputs to `c`, zeroing the loss
-   without learning.
-2. **No BatchNorm** — batch normalisation re-centres activations, causing the
-   same collapse.
-3. **Centre `c` ≠ origin** — if `c = 0`, the network maps everything to zero
-   trivially. `c` is initialised as the mean embedding after one random-weight
-   forward pass.
+**Evaluation v2** compares all 8 methods together in one table and one discovery curve.
 
 ---
 
-## 5. Ensemble Scoring & Rank Normalisation
+### DeepSVDD — First Implementation (Cells 56–76)
 
-A naïve average of raw anomaly scores across methods is **not valid**: ECOD
-returns log-probabilities (negative, near zero), Isolation Forest returns
-signed path-length scores (~0.5 for inliers), and DeepSVDD returns Euclidean
-distances. These live on completely different scales and distributions.
+**What is DeepSVDD?**
 
-### Why Rank Normalisation
+Deep Support Vector Data Description (Ruff et al., 2018) is the first method that **learns** from the data rather than applying a fixed formula. It trains a neural network to map all objects into a compact sphere in a low-dimensional space. After training:
 
-Rank normalisation converts each method's scores to **uniform percentile
-ranks** before combining them:
+- Objects that fit the sphere (normal) → close to the centre → low anomaly score
+- Objects that don't fit (anomalous) → far from the centre → high anomaly score
 
-```
-rank_i = rank(score_i) / N
-```
+**Three critical design rules:**
 
-This makes every method's output distribution identical (uniform on [0, 1]),
-so a simple average is meaningful.
+| Rule | Reason |
+|---|---|
+| No bias terms | A bias can shift all outputs to the centre `c`, giving loss=0 trivially — network learns nothing |
+| No BatchNorm | Re-centres activations, same collapse risk as bias |
+| Centre `c` ≠ origin | If c=0, mapping everything to zero satisfies the objective trivially |
 
-### Top-3 Ensemble (Committee Approach)
+**Architecture (first version):** Fixed 3-layer MLP with `hidden_dim=128`, `rep_dim=32`.
 
-Rather than averaging all methods indiscriminately, only the **top-3
-performing methods** (by ROC-AUC) are included in the ensemble. Blending
-weak detectors with strong ones degrades the ensemble. The rank-normalised
-scores of the top-3 are averaged to produce the final ensemble anomaly score.
+**Two variants trained:**
 
----
-
-## 6. Results
-
-### 6.1 Full Comparison Table
-
-| Method | ROC-AUC (4–5) | PR-AUC (4–5) | Recall@100 (4–5) | Spearman (1–5) |
+| Variant | Input | Architecture | Epochs | LR |
 |---|---|---|---|---|
-| **PCA (Protege)** | **0.8674** | **0.1052** | **0.1744** | 0.0174 |
-| Raw BYOL + ECOD | 0.5892 | 0.0213 | 0.0349 | 0.0073 |
-| DeepSVDD (BYOL) | 0.5990 | 0.0198 | 0.0349 | — |
-| MP + IsoForest | 0.5592 | 0.0195 | 0.0349 | 0.0219 |
-| MP + ECOD | 0.5585 | 0.0187 | 0.0465 | 0.0224 |
-| MP + COPOD | 0.5550 | 0.0191 | 0.0465 | 0.0213 |
-| MP + EIF | 0.5503 | 0.0216 | **0.0581** | 0.0181 |
-| DeepSVDD (MP) | 0.5476 | 0.0213 | 0.0349 | — |
-| Raw BYOL + COPOD | 0.4655 | 0.0130 | 0.0000 | 0.0204 |
-| MP + L2 | 0.4518 | 0.0124 | 0.0000 | 0.0178 |
+| DeepSVDD (BYOL) | 512-dim raw BYOL | 512→128→64→32 | 150 | 1e-3 |
+| DeepSVDD (MP) | 44-dim MP features | 44→128→64→32 | 150 | 3e-4 |
 
-### 6.2 Key Observations
+> Note: the MP variant was tuned by the student — `hidden_dim` raised from 64 to 128, `rep_dim` from 16 to 32, `lr` reduced to 3e-4, `seed` changed to 123. These changes were made after observing the initial convergence behaviour.
 
-* **PCA (Protege) dominates** on all primary metrics. Its reconstruction-error
-  score is a powerful proxy for anomalousness in this dataset.
-* **Raw BYOL + ECOD** is the strongest unsupervised alternative at ROC-AUC
-  0.5892, but its Spearman is the worst of the group, suggesting it captures a
-  binary "outlier vs. inlier" split rather than a graded ranking.
-* **Moment Pooling variants** cluster around ROC-AUC 0.55. The Spearman
-  values for MP methods (0.018–0.022) are modestly higher than PCA's (0.017),
-  hinting that the compressed moments carry some graded ranking signal across
-  the 1–5 scale — but this does not translate into better binary separation.
-* **MP + EIF achieves the best Recall@100 among non-PCA methods** (0.0581),
-  making it the most operationally useful challenger if the goal is to surface
-  rare sources in a short review list.
-* **DeepSVDD** performs comparably to the statistical methods without learning
-  an obviously better representation, possibly because 150 training epochs on
-  CPU are insufficient or because the unlabelled training set contains too
-  many inliers for the hypersphere to find a meaningful boundary.
-* **MP + L2 and Raw BYOL + COPOD** both achieve Recall@100 = 0, indicating
-  their ranking places no true anomaly in the top 100 reviewed sources — they
-  are unsuitable for operational use in this form.
+**Diagnostics added:**
+- Training loss curves (one per variant) to check convergence
+- 2D PCA embedding plot of the learned 32-dim space, coloured by true label (left) and by SVDD score (right) — if both panels look similar, the model has learned something meaningful
 
 ---
 
-## 7. Operational Recommendation
+### DeepSVDD — Improvements Attempt (Cells 77–83)
 
-For the current stage of the MGCLS anomaly-detection effort:
+**Date noted in notebook: 08/05/2026**
 
-1. **Use PCA (Protege) as the primary scorer.** It substantially outperforms
-   all benchmarked alternatives.
-2. **Recall@100 should be the primary success metric** for future method
-   development: the operational task is to find rare, scientifically
-   interesting sources in the shortest possible review queue.
-3. **MP + EIF is the best secondary method** to run alongside PCA. Its
-   complementary Recall@100 may catch anomalies that PCA misses.
-4. **DeepSVDD is promising** but needs further investigation: more training
-   epochs, GPU acceleration, or pretraining on a self-supervised objective
-   before fine-tuning with the SVDD loss.
+Several modifications to DeepSVDD were tested to try to improve performance. The improved architecture is described in markdown (cells 79–81 contain the code/config as markdown notes rather than executable cells — these are design notes for the next iteration).
+
+**Changes tested:**
+
+| Change | Original | Improved | Why |
+|---|---|---|---|
+| Architecture depth | 3 layers (fixed) | 4 layers (`depth` parameter) | Less aggressive compression per step: 512→384→192→64→32 instead of 512→128→64→32 |
+| Training epochs | 150 | 200 (BYOL), 100 (MP) | More epochs for the larger network to converge |
+| Hidden dim (BYOL) | 128 | 256 | Wider network for 512-dim input |
+| LR schedule | Fixed 1e-3 | Cosine annealing 1e-3 → 1e-5 | Avoids oscillation near convergence |
+| Gradient clipping | None | `clip_grad_norm_=1.0` | Prevents large-gradient spikes from destabilising training |
+| Weight decay | 1e-6 | 1e-5 | Slightly stronger regularisation |
+| Collapse detection | None | Auto-warn if loss < 1e-6 before epoch 10 | Catch the "hypersphere collapse" failure mode early |
+
+**Outcome noted by the student:** *"Despite the architectural and training improvements, the results were not better than the previous approach."*
+
+This is an important finding. DeepSVDD is sensitive to initialisation and the specific geometry of the data. The improvements address known failure modes, but do not guarantee better performance on every dataset.
 
 ---
 
-## 8. Next Steps
+### Final Evaluation (Cells 70–75)
 
-- [ ] Evaluate an **ensemble of PCA + MP + EIF** using rank normalisation to
-  check whether blending catches additional anomalies missed by PCA alone.
-- [ ] Investigate **DeepSVDD with more epochs** (GPU) or a two-phase
-  pretraining strategy.
-- [ ] Pivot the hyperparameter sweep to maximise **Recall@100** directly,
-  rather than ROC-AUC.
-- [ ] Extend the benchmark with **Local Outlier Factor (LOF)** and
-  **Autoencoder reconstruction error** on MP features.
+**What happens:** All 10 methods are collected into `all_methods_s5` and evaluated together.
+
+| Group | Methods |
+|---|---|
+| Baseline | PCA (Protege) |
+| Moment Pooling | MP + L2, MP + IsoForest, MP + EIF, MP + ECOD, MP + COPOD |
+| Raw BYOL | Raw BYOL + ECOD, Raw BYOL + COPOD |
+| Learned | DeepSVDD (BYOL), DeepSVDD (MP) |
+
+**Final plot:** ROC-AUC is computed for every method. The top-3 (excluding Protege) are identified automatically and plotted alongside Protege on a single cumulative discovery curve. This is the summary figure for the weekly meeting.
+
+---
+
+## Key Findings Summary
+
+| Finding | Explanation |
+|---|---|
+| Protege wins all metrics | Expected — built with real human labels and active learning over years |
+| Hyperparameter sweep improved MP slightly | `latent_dim=16, order=3` gave the best ROC-AUC for MP+ECOD |
+| Raw BYOL comparable to MP | PCA compression does not clearly help or hurt — depends on the detector |
+| DeepSVDD did not beat statistical methods | The learned hypersphere objective did not adapt well enough to this dataset in the unsupervised setting |
+| Spearman ≈ 0 for all methods | No method reliably tracks the full 1–5 human scale — they only partially separate score ≥ 4 |
+| Gap to Protege remains | The gap quantifies how much human-in-the-loop labelling contributes |
+
+---
+
+## What Is Next
+
+- **PatchCore** — use features from multiple layers of the BYOL encoder, not just the final embedding. Gives richer local structure for anomaly detection. Requires re-running the feature extractor.
+- **Simulated Protege** — reproduce the active learning loop with catalogue labels as oracle, to measure precisely how much the human annotations contribute.
+
+---
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| **BYOL** | Bootstrap Your Own Latent — a self-supervised method that trains a network on images without labels, producing a 512-dim feature vector per source |
+| **Protege** | The supervisor's active learning system — iteratively asks a human to label sources, trains a GP on the labels, uses the GP to rank all sources |
+| **Moment Pooling** | Dimensionality reduction: PCA + polynomial feature expansion to capture cross-moment statistics |
+| **EIF** | Extended Isolation Forest — uses random hyperplane cuts instead of axis-aligned cuts |
+| **ECOD** | Empirical Cumulative Distribution Outlier Detection — scores objects by how extreme they are in the tail of each feature distribution |
+| **COPOD** | Copula-based Outlier Detection — models the joint distribution of features |
+| **DeepSVDD** | Deep Support Vector Data Description — trains a neural network to map normal objects into a compact hypersphere |
+| **ROC-AUC** | Area under the Receiver Operating Characteristic curve — main comparison metric |
+| **Recall@100** | Fraction of all true anomalies found in the top 100 ranked candidates |
+| **Hypersphere collapse** | DeepSVDD failure mode where the network maps everything to the same point, making all anomaly scores equal |
